@@ -93,6 +93,6 @@ Power BI · Tableau
 
 ## 📫 Contact
 
-LinkedIn: [Hayeon Kim](YOUR_LINKEDIN_URL)
+LinkedIn: [Hayeon Kim](www.linkedin.com/in/hayeonkim1217)
 
 Email: YOUR_EMAIL
