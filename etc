@@ -1,0 +1,583 @@
+# %%
+"""
+SL채널 외부데이터 수집 : 나이스(NEIS) 학사일정/휴무일정 -> Snowflake 적재
+
+데이터 출처 : 나이스 교육정보 개방포털 (https://open.neis.go.kr) - SchoolSchedule API
+적재 대상   : TOK.OPEN.MT_SCHOOL_SCHEDULE (최신 스냅샷, 전체 재적재)
+              TOK.TOK.SE_SCHOOL_SCHEDULE (이력 누적, APPEND)
+
+쥬피터에서 사용하는 방법:
+    1) 아래 "설정값" 셀에서 AY, NEIS_API_KEY, SNOWFLAKE_PRIVATE_KEY_PATH 등을 확인/수정
+    2) 함수 정의 셀들을 위에서부터 순서대로 실행
+    3) 맨 아래 "실행" 셀을 실행
+
+커맨드라인(CLI)에서 사용하는 방법 (배치/스케줄러용):
+    python neis_school_schedule_loader.py --schools-csv schools_sample.csv --dry-run
+    python neis_school_schedule_loader.py --ay 2026
+
+주의:
+    - 인증정보는 가능하면 코드에 하드코딩하지 않고 환경변수로 주입하세요.
+      부득이하게 아래 설정값 셀에 직접 적는 경우, 이 파일이 있는 폴더를
+      다른 사람과 공유하지 않도록 주의하세요.
+    - 사내망 환경에서 open.neis.go.kr 접속 시 OpenSSL 인증서 체인 검증 오류
+      (Missing Authority Key Identifier)가 발생할 수 있어, 아래에서 truststore로
+      OS 신뢰 저장소를 사용하도록 패치합니다. (pip install truststore)
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Iterable
+
+try:
+    import truststore
+
+    truststore.inject_into_ssl()
+except ImportError:
+    # truststore가 없는 환경에서는 기본 certifi 체인으로 시도합니다.
+    # open.neis.go.kr 호출 시 SSL 오류가 나면 `pip install truststore`로 해결하세요.
+    pass
+
+import requests
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("neis_school_schedule_loader")
+
+# %%
+## 설정값 (쥬피터에서는 이 셀 값을 직접 수정해서 쓰면 됩니다) ----------------------
+
+# 수집할 학년도. None이면 오늘 날짜 기준으로 자동 계산됩니다.
+AY: int | None = None
+
+# 나이스 Open API 인증키. 활용가이드 > 인증키 신청에서 발급.
+# 환경변수 NEIS_API_KEY가 설정되어 있으면 그 값이 우선 적용됩니다.
+NEIS_API_KEY: str = os.environ.get("NEIS_API_KEY", "2b341befb67845fba7f3d63232d07576")
+
+# Snowflake 접속 정보 (사내 표준: 키페어(RSA 개인키) 인증)
+SNOWFLAKE_ACCOUNT: str = os.environ.get("SNOWFLAKE_ACCOUNT", "UQWXCDI-PULMUONE_SEOUL")
+SNOWFLAKE_USER: str = os.environ.get("SNOWFLAKE_USER", "USER_PYTHON_SERVICE")
+SNOWFLAKE_WAREHOUSE: str = os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
+SNOWFLAKE_ROLE: str = os.environ.get("SNOWFLAKE_ROLE", "")
+
+# 키페어 개인키(.p8) 파일 경로.
+SNOWFLAKE_PRIVATE_KEY_PATH: str = os.environ.get(
+    "SNOWFLAKE_PRIVATE_KEY_PATH", "/home/analytics/keys/rsa_linux.p8"
+)
+# 개인키 파일에 암호가 걸려 있는 경우에만 입력 (없으면 빈 문자열로 둘 것)
+SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: str = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "")
+
+# 학교 목록을 CSV에서 가져올지 여부. None이면 NEIS schoolInfo API에서 전국 학교를 직접 조회.
+SCHOOLS_CSV: str | None = None
+
+# 테스트용으로 처리할 학교 수를 제한하고 싶을 때 (예: 10). 전체 처리 시 None.
+LIMIT: int | None = None
+
+# True면 Snowflake 적재 없이 수집 결과만 CSV로 저장 (연결/수집 테스트용)
+DRY_RUN: bool = False
+DRY_RUN_OUT: str = "dry_run_result.csv"
+
+NEIS_BASE_URL = "https://open.neis.go.kr/hub/SchoolSchedule"
+NEIS_SCHOOL_INFO_URL = "https://open.neis.go.kr/hub/schoolInfo"
+PAGE_SIZE = 1000
+REQUEST_SLEEP_SEC = 0.2
+MAX_RETRY = 3
+
+MT_TABLE = "TOK.OPEN.MT_SCHOOL_SCHEDULE"
+SE_TABLE = "TOK.TOK.SE_SCHOOL_SCHEDULE"
+
+# NEIS SchoolSchedule 응답 컬럼 (실제 API 호출로 확인한 필드명)
+SCHEDULE_FIELDS = [
+    "ATPT_OFCDC_SC_CODE",
+    "ATPT_OFCDC_SC_NM",
+    "SD_SCHUL_CODE",
+    "SCHUL_NM",
+    "AY",
+    "AA_YMD",
+    "EVENT_NM",
+    "EVENT_CNTNT",
+    "SCHUL_CRSE_SC_NM",
+    "DGHT_CRSE_SC_NM",
+    "ONE_GRADE_EVENT_YN",
+    "TW_GRADE_EVENT_YN",
+    "THREE_GRADE_EVENT_YN",
+    "FR_GRADE_EVENT_YN",
+    "FIV_GRADE_EVENT_YN",
+    "SIX_GRADE_EVENT_YN",
+    "SBTR_DD_SC_NM",
+    "LOAD_DTM",
+]
+
+
+# %%
+## 자료형 정의 -----------------------------------------------------------------
+
+@dataclass
+class School:
+    atpt_ofcdc_sc_code: str
+    sd_schul_code: str
+    schul_nm: str = ""
+
+
+@dataclass
+class FetchStats:
+    schools_total: int = 0
+    schools_with_data: int = 0
+    schools_failed: int = 0
+    rows_total: int = 0
+    failed_schools: list = field(default_factory=list)
+
+
+# %%
+## 학년도 / 학교 목록 ------------------------------------------------------------
+
+def default_academic_year(today: date | None = None) -> int:
+    """NEIS 학년도(AY)는 3월 시작. 1~2월은 전년도 학년도로 간주."""
+    today = today or date.today()
+    return today.year if today.month >= 3 else today.year - 1
+
+
+def default_date_range(ay: int) -> tuple[str, str]:
+    """학년도 기준 3/1 ~ 익년 2월 말일 (윤년이면 2/29까지 정확히 계산)."""
+    end_date = date.fromordinal(date(ay + 1, 3, 1).toordinal() - 1)
+    return f"{ay}0301", end_date.strftime("%Y%m%d")
+
+
+def load_schools_from_csv(path: str) -> list[School]:
+    schools: list[School] = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        required_cols = {"ATPT_OFCDC_SC_CODE", "SD_SCHUL_CODE"}
+        if not required_cols.issubset(set(reader.fieldnames or [])):
+            raise ValueError("학교 CSV에는 ATPT_OFCDC_SC_CODE, SD_SCHUL_CODE 컬럼이 필요합니다.")
+        for row in reader:
+            office_code = (row.get("ATPT_OFCDC_SC_CODE") or "").strip()
+            school_code = (row.get("SD_SCHUL_CODE") or "").strip()
+            if office_code and school_code:
+                schools.append(
+                    School(
+                        atpt_ofcdc_sc_code=office_code,
+                        sd_schul_code=school_code,
+                        schul_nm=(row.get("SCHUL_NM") or "").strip(),
+                    )
+                )
+    return schools
+
+
+def load_schools_from_neis(session: requests.Session, api_key: str | None) -> list[School]:
+    """NEIS schoolInfo API에서 전국 학교 목록(ATPT_OFCDC_SC_CODE/SD_SCHUL_CODE)을 가져옵니다.
+
+    주의: Snowflake의 TOK.TOK.SE_SCHOOL_INFO_BASE(학교알리미 데이터)는 코드 체계가
+    달라(SCHOOL_INFO_CODE가 NEIS SD_SCHUL_CODE와 다름) 여기서 쓸 수 없습니다.
+    """
+    schools: list[School] = []
+    p_index = 1
+    while True:
+        params = {"Type": "json", "pIndex": p_index, "pSize": PAGE_SIZE}
+        if api_key:
+            params["KEY"] = api_key
+
+        payload = _request_with_retry(session, params, base_url=NEIS_SCHOOL_INFO_URL)
+        if payload is None:
+            raise RuntimeError("NEIS schoolInfo API 호출 실패")
+
+        result_code = _extract_result_code(payload, node_key="schoolInfo")
+        if result_code == "INFO-200":
+            break
+        if result_code and result_code != "INFO-000":
+            message = _extract_result_message(payload, node_key="schoolInfo")
+            raise RuntimeError(f"NEIS schoolInfo API 오류 [{result_code}] {message}")
+
+        info_node = payload.get("schoolInfo")
+        page_rows = []
+        if isinstance(info_node, list) and len(info_node) > 1:
+            page_rows = info_node[1].get("row", []) or []
+
+        for row in page_rows:
+            office_code = (row.get("ATPT_OFCDC_SC_CODE") or "").strip()
+            school_code = (row.get("SD_SCHUL_CODE") or "").strip()
+            # 개교 전 학교("가칭" 등)는 SD_SCHUL_CODE가 공백으로 내려오므로 제외합니다.
+            if office_code and school_code:
+                schools.append(
+                    School(
+                        atpt_ofcdc_sc_code=office_code,
+                        sd_schul_code=school_code,
+                        schul_nm=(row.get("SCHUL_NM") or "").strip(),
+                    )
+                )
+
+        if len(page_rows) < PAGE_SIZE:
+            break
+        p_index += 1
+
+    return schools
+
+
+# %%
+## NEIS API 호출 ----------------------------------------------------------------
+
+def fetch_school_schedule(
+    session: requests.Session,
+    school: School,
+    from_ymd: str,
+    to_ymd: str,
+    api_key: str | None,
+) -> list[dict]:
+    """한 학교의 학사일정을 전체 페이지 수집."""
+    rows: list[dict] = []
+    p_index = 1
+    while True:
+        params = {
+            "Type": "json",
+            "pIndex": p_index,
+            "pSize": PAGE_SIZE,
+            "ATPT_OFCDC_SC_CODE": school.atpt_ofcdc_sc_code,
+            "SD_SCHUL_CODE": school.sd_schul_code,
+            "AA_FROM_YMD": from_ymd,
+            "AA_TO_YMD": to_ymd,
+        }
+        if api_key:
+            params["KEY"] = api_key
+
+        payload = _request_with_retry(session, params)
+        if payload is None:
+            raise RuntimeError(f"NEIS API 호출 실패: {school.atpt_ofcdc_sc_code}/{school.sd_schul_code}")
+
+        result_code = _extract_result_code(payload)
+        if result_code == "INFO-200":
+            break  # 해당 학교/기간 데이터 없음
+        if result_code and result_code != "INFO-000":
+            message = _extract_result_message(payload)
+            raise RuntimeError(f"NEIS API 오류 [{result_code}] {message}")
+
+        schedule_node = payload.get("SchoolSchedule")
+        page_rows = []
+        if isinstance(schedule_node, list) and len(schedule_node) > 1:
+            page_rows = schedule_node[1].get("row", []) or []
+        rows.extend(page_rows)
+
+        if len(page_rows) < PAGE_SIZE:
+            break
+        p_index += 1
+
+    return rows
+
+
+def _request_with_retry(session: requests.Session, params: dict, base_url: str = NEIS_BASE_URL) -> dict | None:
+    for attempt in range(1, MAX_RETRY + 1):
+        try:
+            resp = session.get(base_url, params=params, timeout=15)
+            resp.raise_for_status()
+            time.sleep(REQUEST_SLEEP_SEC)
+            return resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("NEIS 호출 재시도 %s/%s: %s", attempt, MAX_RETRY, exc)
+            time.sleep(1.0 * attempt)
+    return None
+
+
+def _extract_result_code(payload: dict, node_key: str = "SchoolSchedule") -> str | None:
+    for key in (node_key, "RESULT"):
+        node = payload.get(key)
+        if isinstance(node, dict) and "CODE" in node:
+            return node["CODE"]
+        if isinstance(node, list):
+            head = node[0].get("head") if node and isinstance(node[0], dict) else None
+            if head:
+                for item in head:
+                    if "RESULT" in item:
+                        return item["RESULT"]["CODE"]
+    return None
+
+
+def _extract_result_message(payload: dict, node_key: str = "SchoolSchedule") -> str:
+    for key in (node_key, "RESULT"):
+        node = payload.get(key)
+        if isinstance(node, dict) and "MESSAGE" in node:
+            return node["MESSAGE"]
+        if isinstance(node, list):
+            head = node[0].get("head") if node and isinstance(node[0], dict) else None
+            if head:
+                for item in head:
+                    if "RESULT" in item:
+                        return item["RESULT"]["MESSAGE"]
+    return "unknown error"
+
+
+def normalize_row(raw: dict) -> dict:
+    """NEIS 응답 1건을 테이블 컬럼 스키마에 맞춰 정규화."""
+    return {field_name: raw.get(field_name) for field_name in SCHEDULE_FIELDS}
+
+
+def collect_all(
+    schools: Iterable[School],
+    from_ymd: str,
+    to_ymd: str,
+    api_key: str | None,
+) -> tuple[list[dict], FetchStats]:
+    stats = FetchStats()
+    all_rows: list[dict] = []
+
+    with requests.Session() as session:
+        for school in schools:
+            stats.schools_total += 1
+            try:
+                raw_rows = fetch_school_schedule(session, school, from_ymd, to_ymd, api_key)
+            except RuntimeError as exc:
+                stats.schools_failed += 1
+                stats.failed_schools.append((school.sd_schul_code, str(exc)))
+                log.error("수집 실패 - %s(%s): %s", school.schul_nm, school.sd_schul_code, exc)
+                continue
+
+            if raw_rows:
+                stats.schools_with_data += 1
+                stats.rows_total += len(raw_rows)
+                all_rows.extend(normalize_row(r) for r in raw_rows)
+
+            if stats.schools_total % 100 == 0:
+                log.info(
+                    "진행 %d개교 처리 (누적 %d건, 실패 %d건)",
+                    stats.schools_total,
+                    stats.rows_total,
+                    stats.schools_failed,
+                )
+
+    return all_rows, stats
+
+
+# %%
+## Snowflake 연결 / 적재 ----------------------------------------------------------
+
+def _load_private_key_bytes(key_path: str, passphrase: str | None) -> bytes:
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import serialization
+
+    with open(key_path, "rb") as f:
+        p_key = serialization.load_pem_private_key(
+            f.read(),
+            password=passphrase.encode() if passphrase else None,
+            backend=default_backend(),
+        )
+    return p_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def get_snowflake_connection(
+    account: str = SNOWFLAKE_ACCOUNT,
+    user: str = SNOWFLAKE_USER,
+    private_key_path: str = SNOWFLAKE_PRIVATE_KEY_PATH,
+    private_key_passphrase: str = SNOWFLAKE_PRIVATE_KEY_PASSPHRASE,
+    warehouse: str = SNOWFLAKE_WAREHOUSE,
+    role: str = SNOWFLAKE_ROLE,
+):
+    """사내 표준인 Snowflake 키페어(RSA 개인키) 인증으로 접속합니다."""
+    import snowflake.connector
+
+    private_key_der = _load_private_key_bytes(private_key_path, private_key_passphrase or None)
+
+    conn_kwargs = {
+        "account": account,
+        "user": user,
+        "private_key": private_key_der,
+        "warehouse": warehouse,
+    }
+    if role:
+        conn_kwargs["role"] = role
+
+    return snowflake.connector.connect(**conn_kwargs)
+
+
+def load_to_snowflake(conn, rows: list[dict], coll_ymd: str) -> None:
+    import pandas as pd
+    from snowflake.connector.pandas_tools import write_pandas
+
+    if not rows:
+        log.warning("적재할 행이 없어 Snowflake 적재를 건너뜁니다.")
+        return
+
+    df = pd.DataFrame(rows, columns=SCHEDULE_FIELDS)
+
+    # 1) MT_SCHOOL_SCHEDULE : 전체 재적재 (최신 스냅샷)
+    mt_db, mt_schema, mt_name = MT_TABLE.split(".")
+    with conn.cursor() as cur:
+        # write_pandas가 임시 스테이지를 만들 때 세션에 현재 DB/스키마가 필요합니다.
+        cur.execute(f"USE DATABASE {mt_db}")
+        cur.execute(f"USE SCHEMA {mt_schema}")
+        cur.execute(f"TRUNCATE TABLE {MT_TABLE}")
+    success, _, nrows, _ = write_pandas(
+        conn, df, table_name=mt_name, database=mt_db, schema=mt_schema, quote_identifiers=False
+    )
+    if not success or nrows != len(df):
+        raise RuntimeError(f"MT 적재 결과 확인 실패: success={success}, nrows={nrows}, expected={len(df)}")
+    log.info("MT_SCHOOL_SCHEDULE 적재 완료: %d행", nrows)
+
+    # 2) SE_SCHOOL_SCHEDULE : 이력 누적 (같은 COLL_YMD 재실행 시 중복 방지 위해 선삭제 후 적재)
+    df_se = df.copy()
+    df_se.insert(0, "COLL_YMD", coll_ymd)
+    se_db, se_schema, se_name = SE_TABLE.split(".")
+    with conn.cursor() as cur:
+        cur.execute(f"USE DATABASE {se_db}")
+        cur.execute(f"USE SCHEMA {se_schema}")
+        cur.execute(f"DELETE FROM {SE_TABLE} WHERE COLL_YMD = %s", (coll_ymd,))
+    success, _, nrows, _ = write_pandas(
+        conn, df_se, table_name=se_name, database=se_db, schema=se_schema, quote_identifiers=False
+    )
+    if not success or nrows != len(df_se):
+        raise RuntimeError(f"SE 적재 결과 확인 실패: success={success}, nrows={nrows}, expected={len(df_se)}")
+    log.info("SE_SCHOOL_SCHEDULE 적재 완료: %d행 (COLL_YMD=%s)", nrows, coll_ymd)
+
+
+def write_csv_preview(rows: list[dict], path: str) -> None:
+    if not rows:
+        log.warning("미리보기로 저장할 행이 없습니다.")
+        return
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=SCHEDULE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    log.info("드라이런 결과 저장: %s (%d행)", path, len(rows))
+
+
+# %%
+## 한 번에 실행하는 함수 (쥬피터/CLI 공통) -------------------------------------------
+
+def run(
+    ay: int | None = None,
+    from_ymd: str | None = None,
+    to_ymd: str | None = None,
+    schools_csv: str | None = None,
+    limit: int | None = None,
+    api_key: str | None = None,
+    dry_run: bool = False,
+    dry_run_out: str = "dry_run_result.csv",
+) -> FetchStats:
+    """NEIS 학사일정을 수집해서 Snowflake에 적재(또는 드라이런)합니다."""
+    if bool(from_ymd) != bool(to_ymd):
+        raise ValueError("from_ymd와 to_ymd는 함께 지정해야 합니다.")
+    if not from_ymd:
+        ay = ay or default_academic_year()
+        from_ymd, to_ymd = default_date_range(ay)
+
+    log.info("수집 기간: %s ~ %s", from_ymd, to_ymd)
+
+    if not api_key:
+        log.warning("인증키가 설정되지 않았습니다. 인증키 없이 호출하면 호출 한도가 낮을 수 있습니다.")
+
+    conn = None
+    try:
+        if schools_csv:
+            schools = load_schools_from_csv(schools_csv)
+        else:
+            with requests.Session() as school_info_session:
+                schools = load_schools_from_neis(school_info_session, api_key)
+
+        if limit:
+            schools = schools[:limit]
+
+        if not schools:
+            raise RuntimeError("수집 대상 학교가 0개입니다. 학교 목록을 확인하세요.")
+
+        log.info("대상 학교 수: %d", len(schools))
+
+        rows, stats = collect_all(schools, from_ymd, to_ymd, api_key)
+
+        log.info(
+            "수집 완료 - 전체 %d개교 / 데이터 존재 %d개교 / 실패 %d개교 / 총 %d행",
+            stats.schools_total,
+            stats.schools_with_data,
+            stats.schools_failed,
+            stats.rows_total,
+        )
+        if stats.failed_schools:
+            for code, err in stats.failed_schools[:20]:
+                log.error("  실패 학교코드 %s: %s", code, err)
+
+        if dry_run:
+            write_csv_preview(rows, dry_run_out)
+            return stats
+
+        if not rows:
+            raise RuntimeError("수집 결과가 0건입니다. 기존 MT/SE 테이블 보호를 위해 적재를 중단합니다.")
+
+        if conn is None:
+            conn = get_snowflake_connection()
+        coll_ymd = date.today().strftime("%Y%m%d")
+        load_to_snowflake(conn, rows, coll_ymd)
+        return stats
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+# %%
+## CLI 진입점 (배치/스케줄러에서 쓸 때용. 쥬피터에서는 실행되지 않습니다) --------------------
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ay", type=int, default=None, help="학년도 (기본값: 오늘 기준 자동 계산)")
+    parser.add_argument("--from-ymd", type=str, default=None, help="수집 시작일(YYYYMMDD), --ay 대신 직접 지정")
+    parser.add_argument("--to-ymd", type=str, default=None, help="수집 종료일(YYYYMMDD), --ay 대신 직접 지정")
+    parser.add_argument("--schools-csv", type=str, default=None, help="학교 목록 CSV (ATPT_OFCDC_SC_CODE,SD_SCHUL_CODE,SCHUL_NM). 미지정 시 Snowflake에서 조회")
+    parser.add_argument("--limit", type=int, default=None, help="테스트용 처리 학교 수 제한")
+    parser.add_argument("--dry-run", action="store_true", help="Snowflake 적재 없이 수집 결과만 CSV로 저장")
+    parser.add_argument("--out", type=str, default="dry_run_result.csv", help="--dry-run 시 저장할 CSV 경로")
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="나이스 Open API 인증키. 환경변수 NEIS_API_KEY보다 우선 적용됩니다.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    api_key = args.api_key or NEIS_API_KEY or None
+    run(
+        ay=args.ay,
+        from_ymd=args.from_ymd,
+        to_ymd=args.to_ymd,
+        schools_csv=args.schools_csv,
+        limit=args.limit,
+        api_key=api_key,
+        dry_run=args.dry_run,
+        dry_run_out=args.out,
+    )
+    return 0
+
+
+if __name__ == "__main__" and not hasattr(sys, "ps1") and "ipykernel" not in sys.modules:
+    # 쥬피터/인터랙티브 환경에서는 이 블록을 건너뛰고, 아래 "실행" 셀을 쓰세요.
+    try:
+        sys.exit(main())
+    except Exception:
+        log.exception("작업이 실패했습니다.")
+        raise
+
+
+# %%
+## 실행 (쥬피터에서는 위 셀들을 먼저 실행한 뒤, 이 셀을 실행하세요) -----------------------
+
+stats = run(
+    ay=AY,
+    schools_csv=SCHOOLS_CSV,
+    limit=LIMIT,
+    api_key=NEIS_API_KEY or None,
+    dry_run=DRY_RUN,
+    dry_run_out=DRY_RUN_OUT,
+)
+stats
+
+# %%
